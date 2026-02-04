@@ -14,6 +14,8 @@ TEST_TYPE="basic"
 SERVICE_COUNT=${NUM_SERVICES}
 REQUESTS_PER_SVC=${REQUESTS_PER_SERVICE}
 
+DEBUG=false
+
 while [[ $# -gt 0 ]]; do
     case $1 in
         --test)
@@ -28,13 +30,21 @@ while [[ $# -gt 0 ]]; do
             REQUESTS_PER_SVC="$2"
             shift 2
             ;;
+        --debug)
+            DEBUG=true
+            shift
+            ;;
         --help)
             echo "Usage: $0 [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --test TYPE       Test type: basic, roundtrip, scale, bulk (default: basic)"
+            echo "  --test TYPE       Test type: basic, roundtrip, scale, bulk, debug (default: basic)"
             echo "  --services N      Number of services to test (default: ${NUM_SERVICES})"
             echo "  --requests N      Requests per service for bulk test (default: ${REQUESTS_PER_SERVICE})"
+            echo "  --debug           Show verbose debug output"
+            echo ""
+            echo "Debug test (test single service manually):"
+            echo "  $0 --test debug"
             echo ""
             exit 0
             ;;
@@ -58,7 +68,17 @@ gcloud config set project "${PROJECT_ID}"
 
 # Get identity token for calling Cloud Run services
 get_identity_token() {
-    gcloud auth print-identity-token 2>/dev/null
+    local url=$1
+    
+    # Try with audiences first (works with service accounts)
+    local token=$(gcloud auth print-identity-token --audiences="${url}" 2>/dev/null)
+    
+    # If that fails, try without audiences (works with user accounts)
+    if [ -z "${token}" ]; then
+        token=$(gcloud auth print-identity-token 2>/dev/null)
+    fi
+    
+    echo "${token}"
 }
 
 # Call a Cloud Run service
@@ -67,23 +87,46 @@ call_service() {
     local endpoint=$2
     local data=$3
     
+    # Get service URL
     local url=$(gcloud run services describe "${service_name}" \
         --project="${PROJECT_ID}" \
         --region="${REGION}" \
         --format='value(status.url)' 2>/dev/null)
     
     if [ -z "${url}" ]; then
-        echo "ERROR: Could not get URL for ${service_name}"
-        return 1
+        echo '{"error": "Could not get URL for service", "success": false}'
+        return 0
     fi
     
-    local token=$(get_identity_token)
+    # Get identity token with correct audience
+    local token=$(get_identity_token "${url}")
     
-    curl -s -X POST \
+    if [ -z "${token}" ]; then
+        echo '{"error": "Could not get identity token", "success": false}'
+        return 0
+    fi
+    
+    # Make the request and capture both response and HTTP status
+    local response
+    local http_code
+    
+    response=$(curl -s -w "\n%{http_code}" -X POST \
         -H "Authorization: Bearer ${token}" \
         -H "Content-Type: application/json" \
         -d "${data}" \
-        "${url}${endpoint}"
+        "${url}${endpoint}" 2>&1)
+    
+    # Extract HTTP code (last line) and body (everything else)
+    http_code=$(echo "${response}" | tail -n1)
+    local body=$(echo "${response}" | sed '$d')
+    
+    # Check if response is valid JSON
+    if echo "${body}" | jq . >/dev/null 2>&1; then
+        echo "${body}"
+    else
+        # Return error as JSON
+        echo "{\"error\": \"Invalid response\", \"http_code\": \"${http_code}\", \"body\": \"$(echo "${body}" | head -c 200 | tr '"' "'" | tr '\n' ' ')\", \"success\": false}"
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -106,19 +149,39 @@ run_basic_test() {
         # Test ping to VM A
         echo "  Pinging VM A (10.1.0.10)..."
         local result_a=$(call_service "${service_name}" "/ping-vm" '{"target": "a"}')
-        echo "    Result: $(echo "${result_a}" | jq -c '{success, elapsed_ms, source_ip: .response.source_ip}')"
+        
+        # Check if result is valid and extract summary
+        if echo "${result_a}" | jq -e '.success' >/dev/null 2>&1; then
+            echo "    Result: $(echo "${result_a}" | jq -c '{success, elapsed_ms, source_ip: .response.source_ip}' 2>/dev/null || echo "${result_a}")"
+        else
+            echo "    Result: ERROR - $(echo "${result_a}" | jq -c '.error // .body // .' 2>/dev/null | head -c 100)"
+        fi
         
         # Test ping to VM B
         echo "  Pinging VM B (10.2.0.10)..."
         local result_b=$(call_service "${service_name}" "/ping-vm" '{"target": "b"}')
-        echo "    Result: $(echo "${result_b}" | jq -c '{success, elapsed_ms, source_ip: .response.source_ip}')"
         
-        # Append to results
-        jq --arg svc "${service_name}" \
-           --argjson ra "${result_a}" \
-           --argjson rb "${result_b}" \
-           '. += [{"service": $svc, "vm_a": $ra, "vm_b": $rb}]' \
-           "${results_file}" > "${results_file}.tmp" && mv "${results_file}.tmp" "${results_file}"
+        if echo "${result_b}" | jq -e '.success' >/dev/null 2>&1; then
+            echo "    Result: $(echo "${result_b}" | jq -c '{success, elapsed_ms, source_ip: .response.source_ip}' 2>/dev/null || echo "${result_b}")"
+        else
+            echo "    Result: ERROR - $(echo "${result_b}" | jq -c '.error // .body // .' 2>/dev/null | head -c 100)"
+        fi
+        
+        # Append to results (with error handling)
+        if echo "${result_a}" | jq . >/dev/null 2>&1 && echo "${result_b}" | jq . >/dev/null 2>&1; then
+            jq --arg svc "${service_name}" \
+               --argjson ra "${result_a}" \
+               --argjson rb "${result_b}" \
+               '. += [{"service": $svc, "vm_a": $ra, "vm_b": $rb}]' \
+               "${results_file}" > "${results_file}.tmp" && mv "${results_file}.tmp" "${results_file}"
+        else
+            # Store as error entry
+            jq --arg svc "${service_name}" \
+               --arg ra "${result_a}" \
+               --arg rb "${result_b}" \
+               '. += [{"service": $svc, "vm_a_raw": $ra, "vm_b_raw": $rb, "parse_error": true}]' \
+               "${results_file}" > "${results_file}.tmp" && mv "${results_file}.tmp" "${results_file}"
+        fi
     done
     
     echo ""
@@ -128,12 +191,14 @@ run_basic_test() {
     echo ""
     echo "Summary:"
     echo "--------"
-    local total=$(jq 'length' "${results_file}")
-    local success_a=$(jq '[.[] | select(.vm_a.success == true)] | length' "${results_file}")
-    local success_b=$(jq '[.[] | select(.vm_b.success == true)] | length' "${results_file}")
+    local total=$(jq 'length' "${results_file}" 2>/dev/null || echo "0")
+    local success_a=$(jq '[.[] | select(.vm_a.success == true)] | length' "${results_file}" 2>/dev/null || echo "0")
+    local success_b=$(jq '[.[] | select(.vm_b.success == true)] | length' "${results_file}" 2>/dev/null || echo "0")
+    local errors=$(jq '[.[] | select(.parse_error == true or .vm_a.error != null or .vm_b.error != null)] | length' "${results_file}" 2>/dev/null || echo "0")
     echo "  Total services tested: ${total}"
     echo "  VM A connectivity: ${success_a}/${total}"
     echo "  VM B connectivity: ${success_b}/${total}"
+    echo "  Errors: ${errors}"
     
     # Extract unique NAT IPs seen
     echo ""
@@ -143,6 +208,14 @@ run_basic_test() {
             echo "  - ${ip}"
         fi
     done
+    
+    # Show any errors
+    if [ "${errors}" != "0" ]; then
+        echo ""
+        echo "Errors encountered:"
+        jq -r '.[] | select(.vm_a.error != null) | "  \(.service): \(.vm_a.error)"' "${results_file}" 2>/dev/null
+        jq -r '.[] | select(.vm_b.error != null) | "  \(.service): \(.vm_b.error)"' "${results_file}" 2>/dev/null
+    fi
 }
 
 run_roundtrip_test() {
@@ -355,6 +428,118 @@ run_bulk_test() {
 # Run Selected Test
 #------------------------------------------------------------------------------
 
+run_debug_test() {
+    echo ""
+    echo "Running Debug Test (single service, verbose output)..."
+    echo "======================================================="
+    
+    local service_name=$(get_service_name 1)
+    
+    # Get service URL
+    echo ""
+    echo "Step 1: Getting service URL..."
+    local url=$(gcloud run services describe "${service_name}" \
+        --project="${PROJECT_ID}" \
+        --region="${REGION}" \
+        --format='value(status.url)' 2>&1)
+    echo "  Service: ${service_name}"
+    echo "  URL: ${url}"
+    
+    if [ -z "${url}" ] || [[ "${url}" == *"ERROR"* ]]; then
+        echo "  ERROR: Could not get service URL"
+        echo "  Check if service exists: gcloud run services list --region=${REGION}"
+        return 1
+    fi
+    
+    # Get identity token
+    echo ""
+    echo "Step 2: Getting identity token..."
+    
+    # Try with audiences first (service accounts), then without (user accounts)
+    local token=$(gcloud auth print-identity-token --audiences="${url}" 2>/dev/null)
+    if [ -z "${token}" ]; then
+        echo "  (Using user account token - no audience)"
+        token=$(gcloud auth print-identity-token 2>&1)
+    fi
+    
+    if [ -z "${token}" ] || [[ "${token}" == *"ERROR"* ]]; then
+        echo "  ERROR: Could not get identity token"
+        echo "  Token output: ${token}"
+        echo "  Try: gcloud auth login"
+        return 1
+    fi
+    echo "  Token obtained (length: ${#token} chars)"
+    
+    # Test health endpoint first
+    echo ""
+    echo "Step 3: Testing health endpoint..."
+    local health_response=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+        -H "Authorization: Bearer ${token}" \
+        "${url}/health" 2>&1)
+    local health_code=$(echo "${health_response}" | grep "HTTP_CODE:" | cut -d: -f2)
+    local health_body=$(echo "${health_response}" | grep -v "HTTP_CODE:")
+    echo "  HTTP Code: ${health_code}"
+    echo "  Response: ${health_body}"
+    
+    if [ "${health_code}" != "200" ]; then
+        echo ""
+        echo "  WARNING: Health check failed. Service may not be ready."
+        echo "  Common issues:"
+        echo "    - Service still deploying (wait a minute)"
+        echo "    - Container failed to start (check logs)"
+        echo "    - IAM permissions (need Cloud Run Invoker role)"
+        echo ""
+        echo "  Check service logs:"
+        echo "    gcloud run services logs read ${service_name} --region=${REGION} --limit=20"
+    fi
+    
+    # Test ping-vm endpoint
+    echo ""
+    echo "Step 4: Testing ping-vm endpoint..."
+    local ping_response=$(curl -s -w "\nHTTP_CODE:%{http_code}" \
+        -X POST \
+        -H "Authorization: Bearer ${token}" \
+        -H "Content-Type: application/json" \
+        -d '{"target": "a"}' \
+        "${url}/ping-vm" 2>&1)
+    local ping_code=$(echo "${ping_response}" | grep "HTTP_CODE:" | cut -d: -f2)
+    local ping_body=$(echo "${ping_response}" | grep -v "HTTP_CODE:")
+    echo "  HTTP Code: ${ping_code}"
+    echo "  Response:"
+    echo "${ping_body}" | jq . 2>/dev/null || echo "${ping_body}"
+    
+    # Summary
+    echo ""
+    echo "======================================================="
+    echo "Debug Summary:"
+    echo "  Service URL: ${url}"
+    echo "  Health check: HTTP ${health_code}"
+    echo "  Ping VM test: HTTP ${ping_code}"
+    
+    if [ "${ping_code}" == "200" ]; then
+        local success=$(echo "${ping_body}" | jq -r '.success' 2>/dev/null)
+        local source_ip=$(echo "${ping_body}" | jq -r '.response.source_ip' 2>/dev/null)
+        echo "  Ping success: ${success}"
+        echo "  VM saw source IP: ${source_ip}"
+        
+        if [ "${success}" == "true" ]; then
+            echo ""
+            echo "SUCCESS! NAT is working. VM saw traffic from: ${source_ip}"
+        else
+            local error=$(echo "${ping_body}" | jq -r '.error // .response.error // "unknown"' 2>/dev/null)
+            echo ""
+            echo "FAILED: Cloud Run could not reach VM"
+            echo "  Error: ${error}"
+            echo ""
+            echo "  Possible issues:"
+            echo "    - VM not running or target-server not started"
+            echo "    - Firewall rules not allowing traffic from NAT pool"
+            echo "    - VPC peering not configured correctly"
+            echo "    - NAT not configured correctly"
+        fi
+    fi
+}
+
 case ${TEST_TYPE} in
     basic)
         run_basic_test
@@ -368,6 +553,9 @@ case ${TEST_TYPE} in
     bulk)
         run_bulk_test
         ;;
+    debug)
+        run_debug_test
+        ;;
     all)
         run_basic_test
         run_roundtrip_test
@@ -376,7 +564,7 @@ case ${TEST_TYPE} in
         ;;
     *)
         echo "Unknown test type: ${TEST_TYPE}"
-        echo "Available: basic, roundtrip, scale, bulk, all"
+        echo "Available: basic, roundtrip, scale, bulk, debug, all"
         exit 1
         ;;
 esac

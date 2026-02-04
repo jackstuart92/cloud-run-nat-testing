@@ -452,7 +452,7 @@ deploy_service() {
         --image="${SERVICE_IMAGE}" \
         --platform=managed \
         --no-allow-unauthenticated \
-        --ingress=internal-and-cloud-load-balancing \
+        --ingress="${INGRESS_SETTING}" \
         --vpc-egress=all-traffic \
         --network="${SERVERLESS_VPC}" \
         --subnet="${subnet_name}" \
@@ -507,24 +507,36 @@ export -f update_callback_url get_service_name
 seq ${START_INDEX} ${END_INDEX} | xargs -P ${PARALLEL} -I {} bash -c 'update_callback_url {}'
 
 #------------------------------------------------------------------------------
-# Grant IAM permissions for VMs to call Cloud Run
+# Grant IAM permissions for Cloud Run access
 #------------------------------------------------------------------------------
 echo ""
-echo "Configuring IAM for VM -> Cloud Run access..."
+echo "Configuring IAM permissions..."
 
-# Get the default compute service account
+# Get the default compute service account (for VM -> Cloud Run callbacks)
 COMPUTE_SA=$(gcloud iam service-accounts list \
     --project="${PROJECT_ID}" \
     --filter="email:compute@developer.gserviceaccount.com" \
     --format="value(email)" 2>/dev/null | head -1)
 
 if [ -n "${COMPUTE_SA}" ]; then
-    echo "  Granting Cloud Run Invoker to ${COMPUTE_SA}..."
+    echo "  Granting Cloud Run Invoker to compute service account..."
     gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
         --member="serviceAccount:${COMPUTE_SA}" \
         --role="roles/run.invoker" \
         --quiet 2>/dev/null || true
 fi
+
+# Grant Cloud Run Invoker to the current user (for running tests)
+CURRENT_USER=$(gcloud config get-value account 2>/dev/null)
+if [ -n "${CURRENT_USER}" ]; then
+    echo "  Granting Cloud Run Invoker to current user (${CURRENT_USER})..."
+    gcloud projects add-iam-policy-binding "${PROJECT_ID}" \
+        --member="user:${CURRENT_USER}" \
+        --role="roles/run.invoker" \
+        --quiet 2>/dev/null || true
+fi
+
+echo "  IAM permissions configured"
 
 #------------------------------------------------------------------------------
 # Summary
@@ -539,7 +551,11 @@ echo ""
 echo "Each service has:"
 echo "  - Dedicated subnet from Class E range (240.0.x.0/24)"
 echo "  - VPC egress through Private NAT"
-echo "  - Internal ingress for VM callbacks"
+echo "  - Ingress: ${INGRESS_SETTING}"
+echo ""
+echo "IAM Permissions granted:"
+echo "  - Cloud Run Invoker for current user (for testing)"
+echo "  - Cloud Run Invoker for compute service account (for VM callbacks)"
 echo ""
 echo "Service URLs:"
 for i in $(seq ${START_INDEX} $((START_INDEX + 2))); do
@@ -556,4 +572,6 @@ if [ ${COUNT} -gt 3 ]; then
     echo "  ... and $((COUNT - 3)) more"
 fi
 echo ""
-echo "Next step: Run ./scripts/03-run-tests.sh"
+echo "=============================================="
+echo "Next step: ./scripts/03-run-tests.sh --test debug"
+echo "=============================================="

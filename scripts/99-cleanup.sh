@@ -4,10 +4,27 @@
 # Delete all resources created by the NAT testing framework
 #==============================================================================
 
-set -e
+# Don't exit on error - we want to clean up as much as possible
+set +e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../config.env"
+
+# Parse arguments
+SKIP_CONFIRM=false
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --yes|-y)
+            SKIP_CONFIRM=true
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Usage: $0 [--yes|-y]"
+            exit 1
+            ;;
+    esac
+done
 
 echo "=============================================="
 echo "Cloud Run NAT Testing - Cleanup"
@@ -17,22 +34,24 @@ echo "Region:  ${REGION}"
 echo "=============================================="
 
 # Confirm deletion
-echo ""
-echo "WARNING: This will delete ALL resources created by this testing framework:"
-echo "  - All Cloud Run services (nat-test-svc-*)"
-echo "  - All Cloud Run subnets (cr-subnet-*)"
-echo "  - NAT gateway and router"
-echo "  - Target VMs (target-vm-a, target-vm-b)"
-echo "  - VPC peerings"
-echo "  - Firewall rules"
-echo "  - VPCs (serverless-vpc, workload-vpc-a, workload-vpc-b)"
-echo "  - NAT IP addresses"
-echo ""
-read -p "Are you sure you want to continue? (yes/no): " confirm
+if [ "${SKIP_CONFIRM}" != "true" ]; then
+    echo ""
+    echo "WARNING: This will delete ALL resources created by this testing framework:"
+    echo "  - All Cloud Run services (nat-test-svc-*)"
+    echo "  - All Cloud Run subnets (cr-subnet-*)"
+    echo "  - NAT gateway and router"
+    echo "  - Target VMs (target-vm-a, target-vm-b)"
+    echo "  - VPC peerings"
+    echo "  - Firewall rules"
+    echo "  - VPCs (serverless-vpc, workload-vpc-a, workload-vpc-b)"
+    echo "  - NAT IP addresses"
+    echo ""
+    read -p "Are you sure you want to continue? (yes/no): " confirm
 
-if [ "${confirm}" != "yes" ]; then
-    echo "Cleanup cancelled."
-    exit 0
+    if [ "${confirm}" != "yes" ]; then
+        echo "Cleanup cancelled."
+        exit 0
+    fi
 fi
 
 gcloud config set project "${PROJECT_ID}"
