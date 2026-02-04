@@ -859,9 +859,32 @@ WORKLOAD_B_CIDR="10.2.0.0/16"    # Workload VPC B
 
 2. **"NAT IP exhausted"**: Increase NAT_IP_COUNT or use larger NAT pool CIDR
 
-3. **"Connection timeout"**: Check firewall rules allow traffic from 10.255.0.0/16
+3. **"Connection timeout to VM"**: Check:
+   - VM target-server is running: `gcloud compute ssh target-vm-a --zone=$ZONE --tunnel-through-iap --command="curl localhost:8080/health"`
+   - Firewall rules allow traffic from 10.255.0.0/16
+   - VPC peering is established
 
 4. **"Callback failed"**: Verify Private Google Access is enabled and Cloud Run ingress allows internal
+
+5. **VM Python packages not installed** (target-server not responding):
+   - VMs require external IP during startup to download packages from PyPI
+   - Fix manually:
+     ```bash
+     # Add external IP
+     gcloud compute instances add-access-config target-vm-a --zone=us-central1-a --access-config-name='External NAT'
+     
+     # Install packages
+     gcloud compute ssh target-vm-a --zone=us-central1-a --tunnel-through-iap \
+       --command="sudo pip3 install --break-system-packages flask requests && sudo systemctl restart target-server"
+     
+     # Verify
+     gcloud compute ssh target-vm-a --zone=us-central1-a --tunnel-through-iap \
+       --command="curl -s localhost:8080/health"
+     ```
+
+6. **"externally-managed-environment" pip error**: This is PEP 668 on newer Debian. The scripts use `--break-system-packages` to handle this.
+
+7. **HTTP 404 from Cloud Run**: Check ingress setting. For external testing, set `INGRESS_SETTING=all` in `config.env` and redeploy.
 
 ### Debugging Commands
 
@@ -875,8 +898,19 @@ gcloud logging read 'resource.type="nat_gateway"' --limit=50
 # Test VM connectivity
 gcloud compute ssh target-vm-a --zone=$ZONE --tunnel-through-iap
 
+# Check VM service logs
+gcloud compute ssh target-vm-a --zone=$ZONE --tunnel-through-iap \
+  --command="sudo journalctl -u target-server -n 50"
+
+# Check VM startup script logs
+gcloud compute ssh target-vm-a --zone=$ZONE --tunnel-through-iap \
+  --command="sudo cat /var/log/startup-script.log"
+
 # Check Cloud Run service status
 gcloud run services describe nat-test-svc-0001 --region=$REGION
+
+# Run debug test for verbose output
+./scripts/03-run-tests.sh --test debug
 ```
 
 ---

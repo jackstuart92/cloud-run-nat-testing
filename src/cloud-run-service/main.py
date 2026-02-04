@@ -1,12 +1,3 @@
-"""
-Cloud Run NAT Test Service
-
-This service tests NAT connectivity by:
-1. Making outbound requests to target VMs (via Private NAT)
-2. Receiving callbacks from VMs (via Private Google Access)
-3. Tracking and reporting NAT IP usage
-"""
-
 import os
 import time
 import uuid
@@ -28,7 +19,6 @@ CALLBACK_BASE_URL = os.environ.get("CALLBACK_BASE_URL", "")
 # Track callbacks received
 callbacks_received = {}
 
-
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint"""
@@ -37,7 +27,6 @@ def health():
         "service": SERVICE_NAME,
         "revision": SERVICE_REVISION
     })
-
 
 @app.route("/info", methods=["GET"])
 def info():
@@ -49,7 +38,6 @@ def info():
         "vm_b_url": VM_B_URL,
         "callback_base_url": CALLBACK_BASE_URL
     })
-
 
 @app.route("/ping-vm", methods=["POST"])
 def ping_vm():
@@ -121,7 +109,6 @@ def ping_vm():
     
     return jsonify(result)
 
-
 @app.route("/callback", methods=["POST"])
 def callback():
     """
@@ -144,7 +131,6 @@ def callback():
         "service": SERVICE_NAME
     })
 
-
 @app.route("/callbacks", methods=["GET"])
 def get_callbacks():
     """Return all callbacks received"""
@@ -152,7 +138,6 @@ def get_callbacks():
         "service": SERVICE_NAME,
         "callbacks": callbacks_received
     })
-
 
 @app.route("/test-roundtrip", methods=["POST"])
 def test_roundtrip():
@@ -247,7 +232,6 @@ def test_roundtrip():
     
     return jsonify(result)
 
-
 @app.route("/bulk-test", methods=["POST"])
 def bulk_test():
     """
@@ -313,7 +297,6 @@ def bulk_test():
         "source_ips_seen": list(set(r.get("source_ip_seen") for r in successful if r.get("source_ip_seen"))),
         "results": results
     })
-
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
