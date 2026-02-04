@@ -236,15 +236,18 @@ fi
 echo "  Creating Private NAT (mode: ${NAT_MODE})..."
 
 # Note: Private NAT uses internal IP ranges instead of external IPs
-# The NAT pool subnet (10.255.0.0/16) provides the translated addresses
+# The NAT pool subnet (10.255.0.0/16 with purpose=PRIVATE_NAT) provides the translated addresses
+# The --nat-all-subnet-ip-ranges flag specifies which SOURCE subnets to NAT
+# The NAT pool is automatically selected from subnets with purpose=PRIVATE_NAT
 
+# IMPORTANT: endpoint-types must include ENDPOINT_TYPE_MANAGED_PROXY_LB for Cloud Run Direct VPC Egress
 gcloud compute routers nats create "private-nat" \
     --router="nat-router" \
     --region="${REGION}" \
     --project="${PROJECT_ID}" \
     --type=PRIVATE \
     --nat-all-subnet-ip-ranges \
-    --nat-custom-subnet-ip-ranges="nat-pool-subnet" \
+    --endpoint-types=ENDPOINT_TYPE_VM,ENDPOINT_TYPE_MANAGED_PROXY_LB \
     --min-ports-per-vm="${NAT_MIN_PORTS_PER_VM}" \
     --enable-logging
 
@@ -327,13 +330,52 @@ done
 echo ""
 echo "[9/9] Creating target VMs..."
 
-# Create startup script for VMs
-STARTUP_SCRIPT='#!/bin/bash
-apt-get update
-apt-get install -y python3 python3-pip
-pip3 install flask requests
+# Create startup script file (avoids shell escaping issues with --metadata)
+STARTUP_SCRIPT_FILE=$(mktemp)
+cat > "${STARTUP_SCRIPT_FILE}" << 'STARTUP_EOF'
+#!/bin/bash
+set -e
 
-cat > /opt/target-server.py << '\''PYEOF'\''
+# Log startup
+exec > >(tee /var/log/startup-script.log) 2>&1
+echo "Starting VM setup at $(date)"
+
+# Wait for network to be ready
+echo "Waiting for network..."
+for i in {1..30}; do
+    if curl -s --connect-timeout 5 https://www.google.com > /dev/null 2>&1; then
+        echo "Network is ready"
+        break
+    fi
+    echo "Waiting for network... attempt $i/30"
+    sleep 10
+done
+
+# Update and install packages with retries
+echo "Installing packages..."
+for i in {1..3}; do
+    apt-get update && break
+    echo "apt-get update failed, retry $i/3"
+    sleep 10
+done
+
+for i in {1..3}; do
+    apt-get install -y python3 python3-pip && break
+    echo "apt-get install failed, retry $i/3"
+    sleep 10
+done
+
+# Install Python packages (--break-system-packages for PEP 668 compliance on newer Debian)
+echo "Installing Python packages..."
+for i in {1..3}; do
+    pip3 install --break-system-packages flask requests && break
+    echo "pip3 install failed, retry $i/3"
+    sleep 10
+done
+
+# Create the target server application
+echo "Creating target server..."
+cat > /opt/target-server.py << 'PYEOF'
 from flask import Flask, request, jsonify
 import requests
 import logging
@@ -404,14 +446,14 @@ if __name__ == "__main__":
 PYEOF
 
 # Create systemd service
-cat > /etc/systemd/system/target-server.service << SVCEOF
+cat > /etc/systemd/system/target-server.service << 'SVCEOF'
 [Unit]
 Description=NAT Test Target Server
 After=network.target
 
 [Service]
 Type=simple
-Environment=VM_ID=$(hostname)
+Environment=VM_ID=%H
 ExecStart=/usr/bin/python3 /opt/target-server.py
 Restart=always
 RestartSec=5
@@ -423,41 +465,92 @@ SVCEOF
 systemctl daemon-reload
 systemctl enable target-server
 systemctl start target-server
-'
 
-# VM A
+echo "VM setup completed at $(date)"
+echo "SUCCESS" > /var/log/startup-complete
+STARTUP_EOF
+
+# VM A (with ephemeral external IP for package installation during startup)
+# Note: External IP is required for startup script to download packages from PyPI
 if ! gcloud compute instances describe "target-vm-a" --zone="${ZONE}" --project="${PROJECT_ID}" &>/dev/null; then
-    echo "  Creating target-vm-a..."
+    echo "  Creating target-vm-a (with external IP for package installation)..."
     gcloud compute instances create "target-vm-a" \
         --project="${PROJECT_ID}" \
         --zone="${ZONE}" \
         --machine-type="${VM_MACHINE_TYPE}" \
-        --network-interface="network=${WORKLOAD_VPC_A},subnet=workload-a-subnet,private-network-ip=${VM_A_IP},no-address" \
+        --network-interface="network=${WORKLOAD_VPC_A},subnet=workload-a-subnet,private-network-ip=${VM_A_IP},network-tier=STANDARD" \
         --image-family="${VM_IMAGE_FAMILY}" \
         --image-project="${VM_IMAGE_PROJECT}" \
         --tags="nat-target" \
         --scopes="cloud-platform" \
-        --metadata="startup-script=${STARTUP_SCRIPT}"
+        --metadata-from-file="startup-script=${STARTUP_SCRIPT_FILE}"
 else
     echo "  target-vm-a already exists"
+    # Ensure VM has external IP for package installation
+    if ! gcloud compute instances describe "target-vm-a" --zone="${ZONE}" --project="${PROJECT_ID}" \
+        --format="get(networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null | grep -q '.'; then
+        echo "  Adding external IP to target-vm-a..."
+        gcloud compute instances add-access-config "target-vm-a" \
+            --zone="${ZONE}" \
+            --project="${PROJECT_ID}" \
+            --access-config-name="External NAT" 2>/dev/null || true
+    fi
 fi
 
-# VM B
+# VM B (with ephemeral external IP for package installation during startup)
 if ! gcloud compute instances describe "target-vm-b" --zone="${ZONE}" --project="${PROJECT_ID}" &>/dev/null; then
-    echo "  Creating target-vm-b..."
+    echo "  Creating target-vm-b (with external IP for package installation)..."
     gcloud compute instances create "target-vm-b" \
         --project="${PROJECT_ID}" \
         --zone="${ZONE}" \
         --machine-type="${VM_MACHINE_TYPE}" \
-        --network-interface="network=${WORKLOAD_VPC_B},subnet=workload-b-subnet,private-network-ip=${VM_B_IP},no-address" \
+        --network-interface="network=${WORKLOAD_VPC_B},subnet=workload-b-subnet,private-network-ip=${VM_B_IP},network-tier=STANDARD" \
         --image-family="${VM_IMAGE_FAMILY}" \
         --image-project="${VM_IMAGE_PROJECT}" \
         --tags="nat-target" \
         --scopes="cloud-platform" \
-        --metadata="startup-script=${STARTUP_SCRIPT}"
+        --metadata-from-file="startup-script=${STARTUP_SCRIPT_FILE}"
 else
     echo "  target-vm-b already exists"
+    # Ensure VM has external IP for package installation
+    if ! gcloud compute instances describe "target-vm-b" --zone="${ZONE}" --project="${PROJECT_ID}" \
+        --format="get(networkInterfaces[0].accessConfigs[0].natIP)" 2>/dev/null | grep -q '.'; then
+        echo "  Adding external IP to target-vm-b..."
+        gcloud compute instances add-access-config "target-vm-b" \
+            --zone="${ZONE}" \
+            --project="${PROJECT_ID}" \
+            --access-config-name="External NAT" 2>/dev/null || true
+    fi
 fi
+
+# Clean up temp file
+rm -f "${STARTUP_SCRIPT_FILE}"
+
+# Wait for VMs to be ready
+echo ""
+echo "  Waiting for VMs to complete startup (this may take 2-3 minutes)..."
+echo "  Checking VM health..."
+
+for vm in "target-vm-a" "target-vm-b"; do
+    echo "  Waiting for ${vm}..."
+    for i in {1..36}; do  # Wait up to 3 minutes
+        # Check if the target-server is responding
+        health=$(gcloud compute ssh "${vm}" --zone="${ZONE}" --tunnel-through-iap \
+            --command="curl -s localhost:8080/health 2>/dev/null || echo 'not ready'" 2>/dev/null || echo "ssh failed")
+        
+        if echo "${health}" | grep -q '"status": "healthy"'; then
+            echo "    ${vm} is ready!"
+            break
+        fi
+        
+        if [ $i -eq 36 ]; then
+            echo "    WARNING: ${vm} may not be ready. Check logs with:"
+            echo "      gcloud compute ssh ${vm} --zone=${ZONE} --tunnel-through-iap --command='sudo journalctl -u target-server -n 20'"
+        fi
+        
+        sleep 5
+    done
+done
 
 #------------------------------------------------------------------------------
 # Summary
@@ -468,16 +561,20 @@ echo "Infrastructure Setup Complete!"
 echo "=============================================="
 echo ""
 echo "VPCs created:"
-echo "  - ${SERVERLESS_VPC} (240.0.0.0/12 Class E)"
+echo "  - ${SERVERLESS_VPC} (240.0.0.0/12 Class E for Cloud Run)"
 echo "  - ${WORKLOAD_VPC_A} (10.1.0.0/16)"
 echo "  - ${WORKLOAD_VPC_B} (10.2.0.0/16)"
 echo ""
 echo "Private NAT:"
 echo "  - NAT Pool: ${NAT_POOL_CIDR}"
-echo "  - Mode: ${NAT_MODE}"
+echo "  - Translates: 240.x.x.x -> 10.255.x.x"
 echo ""
 echo "Target VMs:"
-echo "  - target-vm-a: ${VM_A_IP}:8080"
-echo "  - target-vm-b: ${VM_B_IP}:8080"
+echo "  - target-vm-a: ${VM_A_IP}:8080 (in workload-vpc-a)"
+echo "  - target-vm-b: ${VM_B_IP}:8080 (in workload-vpc-b)"
 echo ""
-echo "Next step: Run ./scripts/02-deploy-services.sh"
+echo "VPC Peering: serverless-vpc <-> workload-vpc-a, workload-vpc-b"
+echo ""
+echo "=============================================="
+echo "Next step: ./scripts/02-deploy-services.sh --count 10"
+echo "=============================================="
